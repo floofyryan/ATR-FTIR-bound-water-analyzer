@@ -33,7 +33,6 @@ from PyQt6.QtWidgets import (
     QFrame,             # Generic frame; used for divider lines and styled cards
     QSizePolicy,        # Controls how widgets expand/shrink to fill space
     QMessageBox,        # Pop-up alert dialog (errors, warnings)
-    QStackedWidget,     # Imported but not actively used — kept for completeness
     QDialog,            # Base class for the paste-data modal dialog
     QTextEdit,          # Multi-line text box — used in PasteDialog for pasted data
     QDialogButtonBox,   # OK / Cancel button row at the bottom of a dialog
@@ -998,6 +997,23 @@ class StepCard(QFrame):
         self.status_lbl.setText("")        # Clear any summary text
         self.body.setVisible(False)        # Body hidden
 
+    def set_independent(self):
+        """Independent card — always open, but visually distinct from the active pipeline step.
+        Used for Step 6 (Batch Processing) which can run at any time regardless of
+        where the single-sample pipeline is.  Uses teal instead of indigo so it
+        doesn't look like the current pipeline step.
+        """
+        self._active = False; self._done = False
+        self.setProperty("active","false"); self.setProperty("done","false")
+        self.style().unpolish(self); self.style().polish(self)
+        self.num_lbl.setText(str(self.number))
+        # Teal circle — distinct from the indigo active-step circle
+        self.num_lbl.setStyleSheet(
+            f"background:{INTER_CLR};color:#0f1117;border-radius:14px;"
+            f"font-size:12px;font-weight:700;border:none;")
+        self.title_lbl.setStyleSheet(f"color:{INTER_CLR};font-size:13px;font-weight:700;")
+        self.body.setVisible(True)
+
 
 # ── Paste dialog ─────────────────────────────────────────────────────────────
 
@@ -1067,6 +1083,7 @@ class MainWindow(QMainWindow):
         self.last_fit_params = None  # Snapshot of Step 5 params before last fit run
         self._bg_raw_orig   = None  # Original background before zero-shift correction
         self._samp_raw_orig = None  # Original sample before zero-shift correction
+        self._samp_filename = "sample"  # Stem of the loaded sample file; used to tag fit results
 
         self.setAcceptDrops(True)
         self._build_ui()
@@ -1208,7 +1225,7 @@ class MainWindow(QMainWindow):
         b2 = self.s2.body_layout
         self.smooth_sb   = make_spinbox(1, 100, 20)
         self.snip_sb     = make_spinbox(10, 500, 200, step=10)
-        self.norm_wav_sb = make_spinbox(800, 3500, 1740, step=10)
+        self.norm_wav_sb = make_spinbox(400, 4000, 1740, step=10)
         self.norm_wav_sb.valueChanged.connect(
             lambda v: (self._norm_slider.blockSignals(True),
                        self._norm_slider.setValue(max(400,min(4000,v))),
@@ -1338,12 +1355,17 @@ class MainWindow(QMainWindow):
         self.ic_sb  = make_spinbox(3100,3500,3375,step=5)
         self.ih_sb  = make_spinbox(0.001,10.0,0.1,decimals=3,step=0.01)
         self.isg_sb = make_spinbox(1,300,30)
-        self._inter_lbl = QLabel("● Intermediate water"); self._inter_lbl.setStyleSheet(f"color:{INTER_CLR};font-size:12px;font-weight:600;")
-        b5.addWidget(self._inter_lbl)
-        self._ic_row  = param_row("  Center (cm⁻¹)", self.ic_sb)
-        self._ih_row  = param_row("  Height (init.)", self.ih_sb)
-        self._is_row  = param_row("  Sigma (init.)",  self.isg_sb)
-        b5.addLayout(self._ic_row); b5.addLayout(self._ih_row); b5.addLayout(self._is_row)
+        # Wrap all intermediate controls in a single container so they can be
+        # hidden entirely (not just greyed) when double-Gaussian mode is selected.
+        self._inter_container = QWidget()
+        _icl = QVBoxLayout(self._inter_container); _icl.setContentsMargins(0,0,0,0); _icl.setSpacing(4)
+        _inter_lbl = QLabel("● Intermediate water")
+        _inter_lbl.setStyleSheet(f"color:{INTER_CLR};font-size:12px;font-weight:600;")
+        _icl.addWidget(_inter_lbl)
+        _icl.addLayout(param_row("  Center (cm⁻¹)", self.ic_sb))
+        _icl.addLayout(param_row("  Height (init.)", self.ih_sb))
+        _icl.addLayout(param_row("  Sigma (init.)",  self.isg_sb))
+        b5.addWidget(self._inter_container)
 
         self.bc_sb = make_spinbox(3000,3400,3240,step=5)
         self.bh_sb = make_spinbox(0.001,10.0,1.0,decimals=3,step=0.01)
@@ -1397,19 +1419,38 @@ class MainWindow(QMainWindow):
         self._res_c_bound.setStyleSheet(f"color:{BOUND_CLR};font-size:12px;font-weight:600;")
         for _w in [_chead, self._res_c_free, self._res_c_inter, self._res_c_bound]:
             _cl.addWidget(_w)
+        # Fitted sigma (peak width) display — lets users immediately judge peak breadth
+        self._res_sigmas_frame = QFrame()
+        self._res_sigmas_frame.setStyleSheet(
+            f"background:{SURFACE};border:1px solid {BORDER};border-radius:6px;padding:2px;")
+        self._res_sigmas_frame.setVisible(False)
+        _sl = QVBoxLayout(self._res_sigmas_frame)
+        _sl.setContentsMargins(10,6,10,6); _sl.setSpacing(3)
+        _shead = QLabel("Fitted σ  (peak width)")
+        _shead.setStyleSheet(f"color:{ACCENT2};font-size:10px;font-weight:700;letter-spacing:0.5px;")
+        self._res_s_free  = QLabel("")
+        self._res_s_free.setStyleSheet(f"color:{FREE_CLR};font-size:12px;font-weight:600;")
+        self._res_s_inter = QLabel("")
+        self._res_s_inter.setStyleSheet(f"color:{INTER_CLR};font-size:12px;font-weight:600;")
+        self._res_s_bound = QLabel("")
+        self._res_s_bound.setStyleSheet(f"color:{BOUND_CLR};font-size:12px;font-weight:600;")
+        for _w in [_shead, self._res_s_free, self._res_s_inter, self._res_s_bound]:
+            _sl.addWidget(_w)
+
         self._res_warn = QLabel(""); self._res_warn.setStyleSheet(f"color:{DANGER};font-size:11px;"); self._res_warn.setWordWrap(True)
         self._res_copy = QPushButton("📋  Copy to clipboard")
         self._res_copy.setObjectName("save")
         self._res_copy.clicked.connect(self._copy_single_result)
         for w in [self._res_r2, self._res_rmse, self._res_free, self._res_inter,
-                  self._res_bound, self._res_centers_frame, self._res_warn, self._res_copy]:
+                  self._res_bound, self._res_centers_frame, self._res_sigmas_frame,
+                  self._res_warn, self._res_copy]:
             rl.addWidget(w)
         b5.addWidget(self._res_frame)
         self._sv.addWidget(self.s5)
 
         # ── Step 6: Batch processing ──
         self.s6 = StepCard(6, "Batch Processing")
-        self.s6.set_active()   # always open — independent of single-sample steps
+        self.s6.set_independent()   # always open; teal distinguishes it from the active pipeline step
         b6 = self.s6.body_layout
 
         hint6 = QLabel(
@@ -1746,6 +1787,8 @@ class MainWindow(QMainWindow):
             self._samp_lbl.setText(tick)
             self._samp_lbl.setStyleSheet(f"color:{SUCCESS};font-size:11px;")
             self._samp_meta.setText(meta_str)
+            # Store stem (no extension) so fit results can be tagged with the filename
+            self._samp_filename = Path(source).stem if source and source != "pasted" else "sample"
         if self.bg_raw is not None and self.samp_raw is not None:
             self._s1_next.setEnabled(True)
             self.s1.status_lbl.setText("Both files ready — click Next")
@@ -1899,6 +1942,7 @@ class MainWindow(QMainWindow):
         draws the fit overlay and residuals plots, enables the Export button,
         and displays any quality warnings in the status bar.
         """
+        r.setdefault("sample_name", self._samp_filename)  # Tag with filename for clipboard/export
         self.fit_result = r           # Store for export / copy / batch comparison
         self.canvas_main.plot_fit(r)  # Overlay: data + total fit + individual Gaussians
         self.canvas_aux.plot_residuals(r)    # Residuals + ±RMSE band
@@ -1929,6 +1973,20 @@ class MainWindow(QMainWindow):
             else:
                 self._res_c_inter.setVisible(False)
             self._res_c_bound.setText(f"  Bound:         {c['bound']:.2f} cm\u207b\u00b9")
+
+        # Populate fitted \u03c3 (peak widths) \u2014 always shown after a successful fit
+        fp = r["fp"]
+        trip = r["fit_mode"] == "triple"
+        self._res_s_free.setText(f"  Free:          \u03c3 = {abs(fp[2]):.1f} cm\u207b\u00b9")
+        if trip:
+            self._res_s_inter.setText(f"  Intermediate:  \u03c3 = {abs(fp[5]):.1f} cm\u207b\u00b9")
+            self._res_s_inter.setVisible(True)
+            self._res_s_bound.setText(f"  Bound:         \u03c3 = {abs(fp[8]):.1f} cm\u207b\u00b9")
+        else:
+            self._res_s_inter.setVisible(False)
+            self._res_s_bound.setText(f"  Bound:         \u03c3 = {abs(fp[5]):.1f} cm\u207b\u00b9")
+        self._res_sigmas_frame.setVisible(True)
+
         self._res_warn.setText("\n".join(r["warnings"]) if r["warnings"] else "")
         self._res_frame.setVisible(True)
 
@@ -2010,9 +2068,9 @@ class MainWindow(QMainWindow):
 
     def _set_fit_mode(self, mode):
         self.triple_btn.setChecked(mode=="triple"); self.double_btn.setChecked(mode=="double")
-        on = mode=="triple"
-        for w in [self._inter_lbl, self.ic_sb, self.ih_sb, self.isg_sb]:
-            w.setEnabled(on); w.setStyleSheet("" if on else f"color:{TEXT_DIM};")
+        # Hide the entire intermediate container in double-Gaussian mode so the panel
+        # stays clean; just disabling/greying left phantom space and confused users.
+        self._inter_container.setVisible(mode == "triple")
 
     def _set_anchor(self, mode):
         self.anchored_btn.setChecked(mode=="anchored"); self.float_btn.setChecked(mode=="float")
@@ -2316,7 +2374,6 @@ class MainWindow(QMainWindow):
         if not self.fit_result:
             return
         r = self.fit_result
-        r.setdefault("sample_name", "sample")     # Give it a name if not tagged
         header, data = self._result_to_tsv_row(r) # Build the 19-column TSV
         text = header + "\n" + data              # Combine header and data with newline
         QApplication.clipboard().setText(text)    # Put on system clipboard
