@@ -1482,7 +1482,8 @@ class MainWindow(QMainWindow):
         b6.addWidget(self._b6_list)
         samp6_row = QHBoxLayout()
         self._b6_add_btn = QPushButton("➕  Add files")
-        self._b6_rem_btn = QPushButton("✕  Remove selected")
+        self._b6_rem_btn = QPushButton("✕  Remove")
+        self._b6_rem_btn.setToolTip("Remove the selected sample file(s) from the list")
         self._b6_clr_btn = QPushButton("Clear all")
         samp6_row.addWidget(self._b6_add_btn)
         samp6_row.addWidget(self._b6_rem_btn)
@@ -1503,14 +1504,16 @@ class MainWindow(QMainWindow):
         self._b6_status_list.setVisible(False)
         b6.addWidget(self._b6_status_list)
 
-        # Run / export row
-        run6_row = QHBoxLayout()
+        # Run / export row — primary "Run batch" gets its own full-width row so its
+        # label isn't clipped; the two secondary actions share the row below it.
         self._b6_run  = QPushButton("▶  Run batch"); self._b6_run.setObjectName("accent")
         self._b6_save = QPushButton("⬇  Export CSV"); self._b6_save.setObjectName("save")
         self._b6_copy = QPushButton("📋  Copy table"); self._b6_copy.setObjectName("save")
         self._b6_save.setDisabled(True)
         self._b6_copy.setDisabled(True)
-        run6_row.addWidget(self._b6_run); run6_row.addWidget(self._b6_save); run6_row.addWidget(self._b6_copy)
+        b6.addWidget(self._b6_run)
+        run6_row = QHBoxLayout()
+        run6_row.addWidget(self._b6_save); run6_row.addWidget(self._b6_copy)
         b6.addLayout(run6_row)
 
         # Wire up
