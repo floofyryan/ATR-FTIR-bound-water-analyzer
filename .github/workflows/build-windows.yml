@@ -1,0 +1,31 @@
+name: Build Windows executable
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - claude/busy-darwin-JOAic
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller numpy scipy matplotlib PyQt6 olefile
+
+      - name: Build executable
+        run: python build.py
+
+      - name: Upload executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FTIR_Analyzer-windows
+          path: dist/FTIR_Analyzer.exe
