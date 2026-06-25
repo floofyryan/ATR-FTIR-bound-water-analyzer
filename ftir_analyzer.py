@@ -860,18 +860,27 @@ class StepCard(QFrame):
 
     The body (controls, buttons) is hidden in locked/done states to keep the
     left panel compact.  It becomes visible only for the active step.
+
+    A completed (Done) card's header is clickable — emitting `header_clicked`
+    with the card's step index — so the user can jump straight back up the
+    chain instead of pressing "← Back" one step at a time.
     """
+    header_clicked = pyqtSignal(int)   # Emits this card's step index when its header is clicked
+
     def __init__(self, number, title, parent=None):
         super().__init__(parent)            # QFrame base
         self.setObjectName("step_card")    # Matches the CSS rule in STYLESHEET
         self._done = False; self._active = False   # Track current visual state
         self.number = number               # Step number (1–6); shown in the circle
+        self.step_index = number           # Fixed _go_step() index — unaffected by renumbering
 
         outer = QVBoxLayout(self); outer.setContentsMargins(0,0,0,0); outer.setSpacing(0)
 
         # Header row (always visible)
         hdr = QWidget()
         hdr.setStyleSheet("background:transparent;")
+        self._hdr = hdr                    # Kept so we can toggle its clickable cursor
+        hdr.mousePressEvent = self._on_header_press   # Make the header respond to clicks
         hl = QHBoxLayout(hdr); hl.setContentsMargins(16,12,16,12)
         self.num_lbl = QLabel(str(number))
         self.num_lbl.setFixedSize(28,28)
@@ -894,6 +903,18 @@ class StepCard(QFrame):
         self.body_layout = bl
         outer.addWidget(self.body)
 
+    def _on_header_press(self, event):
+        """Header click handler.  Only a completed (Done) step navigates — clicking
+        the active step or a locked (not-yet-reachable) step does nothing."""
+        if self._done:
+            self.header_clicked.emit(self.step_index)
+
+    def _set_clickable(self, on):
+        """Show a pointing-hand cursor on the header when it can be clicked to
+        navigate (i.e. the step is Done)."""
+        self._hdr.setCursor(Qt.CursorShape.PointingHandCursor if on
+                            else Qt.CursorShape.ArrowCursor)
+
     def set_number(self, n):
         """Renumber this card.  Used when a step is hidden (e.g. Step 3 in
         no-background mode) so the remaining cards stay sequentially numbered.
@@ -915,6 +936,7 @@ class StepCard(QFrame):
             f"font-size:12px;font-weight:700;border:none;")
         self.title_lbl.setStyleSheet(f"color:{TEXT};font-size:13px;font-weight:700;")
         self.body.setVisible(True)     # Show the controls for this step
+        self._set_clickable(False)     # Active step is already shown — no navigation
 
     def set_done(self, summary=""):
         """Transition this card to the Done state (step complete)."""
@@ -929,6 +951,7 @@ class StepCard(QFrame):
         self.title_lbl.setStyleSheet(f"color:{SUCCESS};font-size:13px;font-weight:600;")
         self.status_lbl.setText(summary)   # Show a brief summary in the header
         self.body.setVisible(False)        # Collapse the body to save panel space
+        self._set_clickable(True)          # Completed step — click header to jump back
 
     def set_locked(self):
         """Transition this card to the Locked state (not yet reachable)."""
@@ -943,6 +966,7 @@ class StepCard(QFrame):
         self.title_lbl.setStyleSheet(f"color:{TEXT_DIM};font-size:13px;font-weight:600;")
         self.status_lbl.setText("")        # Clear any summary text
         self.body.setVisible(False)        # Body hidden
+        self._set_clickable(False)         # Locked step — not reachable yet
 
     def set_independent(self):
         """Independent card — always open, but visually distinct from the active pipeline step.
@@ -1426,6 +1450,11 @@ class MainWindow(QMainWindow):
             rl.addWidget(w)
         b5.addWidget(self._res_frame)
         self._sv.addWidget(self.s5)
+
+        # Clicking a completed step's header jumps straight back to it, so the
+        # user doesn't have to press "← Back" one step at a time up the chain.
+        for _card in (self.s1, self.s2, self.s3, self.s4, self.s5):
+            _card.header_clicked.connect(self._go_step)
 
         # ── Step 6: Batch processing ──
         self.s6 = StepCard(6, "Batch Processing")
