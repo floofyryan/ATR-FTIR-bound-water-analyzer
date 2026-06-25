@@ -661,8 +661,9 @@ class BatchWorker(QThread):
                 tei = np.argmin(np.abs(sx - s["trim_e"]))  # Index nearest trim end
                 lo, hi = sorted([ti, tei])                  # Ensure lo < hi
                 xT = sx[lo:hi+1]                            # Trimmed x array
-                # Second SNIP pass on the O-H stretch region only
-                yT = snip_baseline(sub[lo:hi+1], min(s["snip"], 100))
+                # Second SNIP pass on the O-H stretch region only (0 = disabled by user)
+                snip2 = s.get("snip2", min(s["snip"], 100))
+                yT = snip_baseline(sub[lo:hi+1], snip2) if snip2 > 0 else sub[lo:hi+1].copy()
                 # Run the Gaussian fit
                 r  = run_fit(xT, yT, s["params"], s["fit_mode"], s["anchor_mode"], s["constraints"])
                 r["sample_name"] = name    # Tag result with filename for the CSV
@@ -1266,13 +1267,28 @@ class MainWindow(QMainWindow):
         b4 = self.s4.body_layout
         self.trim_s_sb = make_spinbox(2500, 3500, 3000, step=10)
         self.trim_e_sb = make_spinbox(3400, 4200, 3800, step=10)
+        self.snip2_sb  = make_spinbox(10, 300, 100, step=10)
         hint4 = QLabel("Crop to the O–H stretch region then apply a second SNIP pass to flatten the baseline.")
         hint4.setStyleSheet(f"color:{TEXT_DIM};font-size:11px;"); hint4.setWordWrap(True)
         b4.addWidget(hint4)
         b4.addLayout(param_row("Trim start (cm⁻¹)", self.trim_s_sb))
         b4.addLayout(param_row("Trim end (cm⁻¹)",   self.trim_e_sb))
+        # Second SNIP pass — its own iterations control + an on/off toggle. Previously
+        # this pass silently reused Step 2's value capped at 100, with no way to tune
+        # or disable it. A narrower window usually wants fewer iterations than Step 2.
+        self.snip2_cb = QCheckBox("Apply 2nd SNIP baseline pass")
+        self.snip2_cb.setChecked(True)
+        self.snip2_cb.setStyleSheet(f"color:{TEXT};font-size:12px;spacing:8px;")
+        self.snip2_cb.setToolTip(
+            "Run a second SNIP baseline correction on the trimmed O–H region only,\n"
+            "to flatten any residual slope before fitting. Uncheck to skip it and fit\n"
+            "the trimmed spectrum as-is.")
+        self.snip2_cb.toggled.connect(self.snip2_sb.setEnabled)
+        b4.addWidget(self.snip2_cb)
+        b4.addLayout(param_row("2nd SNIP iterations", self.snip2_sb, "O–H region only"))
         self.trim_s_sb.valueChanged.connect(self._on_trim_changed)
         self.trim_e_sb.valueChanged.connect(self._on_trim_changed)
+        self.snip2_sb.lineEdit().returnPressed.connect(self._run_step4)
         self._s4_run  = QPushButton("▶  Apply"); self._s4_run.setObjectName("accent")
         self._s4_save = QPushButton("⬇  Save CSV"); self._s4_save.setObjectName("save")
         self._s4_save.setDisabled(True)
@@ -1889,6 +1905,7 @@ class MainWindow(QMainWindow):
         """
         self._s2_run.setEnabled(False); self._s2_run.setText("⏳ Running…")
         self.status_bar.showMessage("Applying baseline correction and normalization…")
+        self._s2_advance = self.samp_proc is None   # Auto-advance only on the first successful run
         snip = self.snip_sb.value(); smooth = self.smooth_sb.value()
         norm  = self.norm_wav_sb.value()
         no_bg = self._no_bg
@@ -1910,6 +1927,8 @@ class MainWindow(QMainWindow):
         self._s2_save.setEnabled(True); self._s2_next.setEnabled(True)
         nxt = "trim" if self._no_bg else "subtract"
         self.status_bar.showMessage(f"Step 2 complete — inspect the normalized spectrum, then save or proceed to {nxt}.")
+        if self._s2_advance:        # First run — advance automatically so the user isn't double-clicking
+            self._go_after_step2()
 
     def _save_step2(self):
         d = QFileDialog.getExistingDirectory(self, "Select folder to save CSVs")
@@ -1931,6 +1950,7 @@ class MainWindow(QMainWindow):
         """
         self._s3_run.setEnabled(False); self._s3_run.setText("⏳ Running…")
         self.status_bar.showMessage("Subtracting background…")
+        self._s3_advance = self.sub_data is None   # Auto-advance only on the first successful run
         def work():
             bx,by = self.bg_proc; sx,sy = self.samp_proc
             by_r = np.interp(sx, bx, by)   # Resample bg onto sample x-grid
@@ -1949,6 +1969,8 @@ class MainWindow(QMainWindow):
         self._s3_run.setEnabled(True); self._s3_run.setText("▶  Subtract")
         self._s3_save.setEnabled(True); self._s3_next.setEnabled(True)
         self.status_bar.showMessage("Step 3 complete — check the subtracted spectrum, then save or proceed.")
+        if self._s3_advance:        # First run — advance automatically (Step 3 has no parameters to tune)
+            self._go_step(4)
 
     def _save_step3(self):
         path, _ = QFileDialog.getSaveFileName(self, "Save subtracted spectrum", "subtracted.csv", "CSV (*.csv)")
@@ -1966,14 +1988,16 @@ class MainWindow(QMainWindow):
         """
         self._s4_run.setEnabled(False); self._s4_run.setText("⏳ Running…")
         self.status_bar.showMessage("Trimming and applying second SNIP correction…")
+        self._s4_advance = self.trim_data is None   # Auto-advance only on the first successful run
         ts = self.trim_s_sb.value(); te = self.trim_e_sb.value()
-        snip = self.snip_sb.value()
+        snip2 = self.snip2_sb.value() if self.snip2_cb.isChecked() else 0
         def work():
             sx, sub = self.sub_data
             ti = np.argmin(np.abs(sx - ts)); tei = np.argmin(np.abs(sx - te))
             lo, hi = sorted([ti, tei])
             xT = sx[lo:hi+1]
-            yT = snip_baseline(sub[lo:hi+1], min(snip, 100))
+            # snip2 == 0 means the user disabled the second pass — fit the trim as-is.
+            yT = snip_baseline(sub[lo:hi+1], snip2) if snip2 > 0 else sub[lo:hi+1].copy()
             return xT, yT
         self._worker = StepWorker(work)
         self._worker.finished.connect(self._done_step4)
@@ -1988,6 +2012,8 @@ class MainWindow(QMainWindow):
         self._s4_run.setEnabled(True); self._s4_run.setText("▶  Apply")
         self._s4_save.setEnabled(True); self._s4_next.setEnabled(True)
         self.status_bar.showMessage(f"Step 4 complete — {len(xT)} points in trim region. Save or proceed.")
+        if self._s4_advance:        # First run — advance automatically to the fit step
+            self._go_step(5)
 
     def _save_step4(self):
         path, _ = QFileDialog.getSaveFileName(self, "Save trimmed spectrum", "trimmed.csv", "CSV (*.csv)")
@@ -2241,6 +2267,7 @@ class MainWindow(QMainWindow):
         constrained = self.constrain_btn.isChecked()
         return {
             "snip":     self.snip_sb.value(),
+            "snip2":    self.snip2_sb.value() if self.snip2_cb.isChecked() else 0,
             "smooth":   self.smooth_sb.value(),
             "norm_wav": self.norm_wav_sb.value(),
             "trim_s":   self.trim_s_sb.value(),
