@@ -493,92 +493,6 @@ def _build_bounds(anchor_mode, fit_mode, params, constraints):
             return ([0,fc-cw,sig_lo,0,bc-cw,sig_lo],
                     [INF,fc+cw,sig_hi,INF,bc+cw,sig_hi])
 
-def _param_covariance(res, n_data):
-    """Estimate the parameter covariance matrix from the Jacobian returned by
-    least_squares.  This is the standard formula: Cov ≈ (JᵀJ)⁻¹ × MSE.
-
-    MSE (mean squared error) = sum(residuals²) / degrees_of_freedom
-    where degrees_of_freedom = n_data_points - n_parameters.
-
-    The square root of the diagonal gives parameter standard errors (se).
-    If the matrix is singular (e.g. perfectly correlated parameters),
-    we return NaN rather than crashing.
-    """
-    J = res.jac                        # Jacobian matrix from the optimiser: shape (n_data, n_params)
-    n, p = J.shape                     # n = data points, p = number of free parameters
-    mse = np.sum(res.fun**2) / max(n - p, 1)   # Mean squared residual; max avoids div-by-zero
-    try:
-        cov = np.linalg.inv(J.T @ J) * mse    # Covariance matrix estimate
-        se  = np.sqrt(np.abs(np.diag(cov)))    # Standard error for each parameter
-    except np.linalg.LinAlgError:
-        # Singular matrix — parameters are not well-determined; return NaN
-        cov = np.full((p,p), np.nan); se = np.full(p, np.nan)
-    return cov, se
-
-def _pct_ci_monte_carlo(fp_full, cov_full, xT, fit_mode, anchor_mode, fixed_centers, n_samples=2000):
-    """Propagate parameter uncertainty into percentage uncertainty via Monte Carlo.
-
-    Why Monte Carlo rather than error propagation formulae?
-    The percentage = area_i / (area_free + area_inter + area_bound) is a nonlinear
-    function of the Gaussian parameters.  The delta-method (linear error propagation)
-    would underestimate the true CI.  Monte Carlo is exact to the precision of the
-    covariance estimate.
-
-    Process:
-      1. Draw 2000 random parameter vectors from the multivariate normal distribution
-         defined by the fitted parameters and their covariance matrix.
-      2. For each draw, reconstruct the three Gaussian curves, integrate them, compute
-         the percentages.
-      3. The 95% CI half-width is 1.96 × standard deviation of those 2000 percentages.
-
-    Returns CI half-widths for free, inter, bound (as fractions, not percent).
-    """
-    rng = np.random.default_rng(0)          # Fixed seed so results are reproducible
-    if np.any(np.isnan(cov_full)):
-        return np.nan, np.nan, np.nan       # Can't sample if covariance estimation failed
-    try:
-        # Draw parameter samples from the estimated joint distribution
-        draws = rng.multivariate_normal(fp_full, cov_full, size=n_samples)
-    except Exception:
-        return np.nan, np.nan, np.nan       # e.g. covariance matrix not positive definite
-    fc0, ic0, bc0 = fixed_centers           # Fixed centre positions (used in anchored mode)
-    free_pcts, inter_pcts, bound_pcts = [], [], []
-    for d in draws:
-        try:
-            if fit_mode == "triple":
-                if anchor_mode == "anchored":
-                    # Parameter vector: [h_f, s_f, h_i, s_i, h_b, s_b] — no centres
-                    h_f,s_f,h_i,s_i,h_b,s_b = d
-                    # Reconstruct full 9-element vector, inserting the fixed centres
-                    fp_s=[h_f,fc0,abs(s_f),h_i,ic0,abs(s_i),h_b,bc0,abs(s_b)]
-                else:
-                    # Parameter vector includes centres: [h_f, c_f, s_f, ...]
-                    h_f,c_f,s_f,h_i,c_i,s_i,h_b,c_b,s_b = d
-                    fp_s=[h_f,c_f,abs(s_f),h_i,c_i,abs(s_i),h_b,c_b,abs(s_b)]
-                # abs(sigma) prevents negative widths from crashing trapezoid
-                fA=trapezoid(gaus(xT,fp_s[0],fp_s[1],fp_s[2]),xT)  # Free peak area
-                iA=trapezoid(gaus(xT,fp_s[3],fp_s[4],fp_s[5]),xT)  # Intermediate peak area
-                bA=trapezoid(gaus(xT,fp_s[6],fp_s[7],fp_s[8]),xT)  # Bound peak area
-            else:
-                if anchor_mode == "anchored":
-                    h_f,s_f,h_b,s_b = d
-                    fp_s=[h_f,fc0,abs(s_f),h_b,bc0,abs(s_b)]
-                else:
-                    h_f,c_f,s_f,h_b,c_b,s_b = d
-                    fp_s=[h_f,c_f,abs(s_f),h_b,c_b,abs(s_b)]
-                fA=trapezoid(gaus(xT,fp_s[0],fp_s[1],fp_s[2]),xT)
-                iA=0.0       # No intermediate peak in double-Gaussian mode
-                bA=trapezoid(gaus(xT,fp_s[3],fp_s[4],fp_s[5]),xT)
-            tot=fA+iA+bA
-            if tot==0: continue   # Skip degenerate draws where all areas collapsed
-            # Store the percentage for this parameter draw
-            free_pcts.append(fA/tot); inter_pcts.append(iA/tot); bound_pcts.append(bA/tot)
-        except Exception:
-            continue              # Skip draws that produce NaN (e.g. negative sigma in exp)
-    # 95% CI half-width = 1.96 × standard deviation (assumes normal distribution of pcts)
-    def ci95(a): return 1.96*np.std(a) if len(a)>=10 else np.nan
-    return ci95(free_pcts), ci95(inter_pcts), ci95(bound_pcts)
-
 def run_fit(xT, yT, params, fit_mode, anchor_mode, constraints):
     """Fit two or three Gaussians to the processed O-H stretch spectrum.
 
@@ -593,7 +507,7 @@ def run_fit(xT, yT, params, fit_mode, anchor_mode, constraints):
                   "float"    — all 9 (or 6) parameters optimised
     constraints : dict with sig_min and sig_max to bound sigma during fitting
 
-    Returns a dict with: spectral arrays, areas, percentages, CIs, R², RMSE,
+    Returns a dict with: spectral arrays, areas, percentages, R², RMSE,
     fitted parameters, centre positions, and any quality warnings.
     """
     # Unpack initial guess values from the params dict
@@ -652,10 +566,6 @@ def run_fit(xT, yT, params, fit_mode, anchor_mode, constraints):
     ss_tot=np.sum((yT-np.mean(yT))**2)                   # Total sum of squares
     r2=1-ss_res/ss_tot if ss_tot else 0                  # R² coefficient of determination
     rmse=np.sqrt(ss_res/len(yT))                         # Root mean squared error in AU
-    # ── Confidence intervals ─────────────────────────────────────────────────
-    cov,se=_param_covariance(res,len(yT))                # Covariance matrix from Jacobian
-    # Monte Carlo propagation of parameter uncertainty into percentage uncertainty
-    ci_f,ci_i,ci_b=_pct_ci_monte_carlo(res.x,cov,xT,fit_mode,anchor_mode,(fc,ic,bc))
     # ── Fit quality warnings ──────────────────────────────────────────────────
     warns=[]
     # Check for suspiciously narrow peaks (sigma < 10 cm⁻¹ is physically unrealistic)
@@ -679,13 +589,8 @@ def run_fit(xT, yT, params, fit_mode, anchor_mode, constraints):
         "free_pct":  fA/total if total else 0,   # Fraction of total area that is free
         "inter_pct": iA/total if total else 0,   # Fraction that is intermediate
         "bound_pct": bA/total if total else 0,   # Fraction that is bound
-        "ci_free":  ci_f,       # 95% CI half-width for free % (Monte Carlo)
-        "ci_inter": ci_i,       # 95% CI half-width for intermediate %
-        "ci_bound": ci_b,       # 95% CI half-width for bound %
         "r2":   r2,             # Coefficient of determination
         "rmse": rmse,           # Root mean squared error in absorbance units
-        "se":   se,             # Parameter standard errors from Jacobian
-        "cov":  cov,            # Full parameter covariance matrix
         "centers":  centers,    # Dict of fitted peak centre positions
         "fp":       fp,         # Full 9- (or 6-) element fitted parameter vector
         "fit_mode": fit_mode,   # "triple" or "double"
@@ -1983,18 +1888,15 @@ class MainWindow(QMainWindow):
         self.plot_tabs.setTabText(0, "Fit result")
         self.plot_tabs.setTabText(1, "Residuals")
 
-        def fmt(pct, ci):
-            return f"{pct*100:.1f}% ± {ci*100:.1f}" if not np.isnan(ci) else f"{pct*100:.1f}%"
-
         self._res_r2.setText(f"R² = {r['r2']:.5f}")
         self._res_rmse.setText(f"RMSE = {r['rmse']:.5f}")
-        self._res_free.setText(f"Free:  {fmt(r['free_pct'], r['ci_free'])}")
+        self._res_free.setText(f"Free:  {r['free_pct']*100:.1f}%")
         if r["fit_mode"] == "triple":
-            self._res_inter.setText(f"Intermediate:  {fmt(r['inter_pct'], r['ci_inter'])}")
+            self._res_inter.setText(f"Intermediate:  {r['inter_pct']*100:.1f}%")
             self._res_inter.setVisible(True)
         else:
             self._res_inter.setVisible(False)
-        self._res_bound.setText(f"Bound:  {fmt(r['bound_pct'], r['ci_bound'])}")
+        self._res_bound.setText(f"Bound:  {r['bound_pct']*100:.1f}%")
         # Show fitted centers only when floating mode was used
         c = r["centers"]
         is_floating = self.float_btn.isChecked()
@@ -2044,7 +1946,6 @@ class MainWindow(QMainWindow):
         if not path: return
         r = self.fit_result
         xT,yT,yfit = r["xT"],r["yT"],r["yfit"]
-        def ci_str(v): return f"{v*100:.2f}" if not np.isnan(v) else "n/a"
         with open(path,"w",newline="") as f:
             w = csv.writer(f)
             hdr = ["wavenumber","data","total_fit","free_gaussian"]
@@ -2057,12 +1958,9 @@ class MainWindow(QMainWindow):
             w.writerow([]); w.writerow(["# Summary"])
             w.writerow(["R2",f"{r['r2']:.6f}"]); w.writerow(["RMSE",f"{r['rmse']:.6f}"])
             w.writerow(["Free area",f"{r['free_a']:.4f}"]); w.writerow(["Free %",f"{r['free_pct']*100:.2f}"])
-            w.writerow(["Free % 95CI hw",ci_str(r['ci_free'])])
             if r["fit_mode"]=="triple":
                 w.writerow(["Inter area",f"{r['inter_a']:.4f}"]); w.writerow(["Inter %",f"{r['inter_pct']*100:.2f}"])
-                w.writerow(["Inter % 95CI hw",ci_str(r['ci_inter'])])
             w.writerow(["Bound area",f"{r['bound_a']:.4f}"]); w.writerow(["Bound %",f"{r['bound_pct']*100:.2f}"])
-            w.writerow(["Bound % 95CI hw",ci_str(r['ci_bound'])])
             fp=r["fp"]; c=r["centers"]
             w.writerow([]); w.writerow(["# Fitted parameters"])
             w.writerow(["Free center",f"{c['free']:.2f}"]); w.writerow(["Free height",f"{fp[0]:.6f}"]); w.writerow(["Free sigma",f"{abs(fp[2]):.2f}"])
@@ -2348,19 +2246,16 @@ class MainWindow(QMainWindow):
         if not ok:
             return
 
-        def ci_str(v):
-            return f"{v*100:.2f}" if not (v is None or (isinstance(v,float) and np.isnan(v))) else "n/a"
-
         with open(path, "w", newline="") as f:
             w = csv.writer(f)
             fm = ok[0]["fit_mode"]
             # Header row
             hdr = ["sample", "r2", "rmse",
-                   "free_pct", "free_pct_ci95hw",
+                   "free_pct",
                    "free_area",
-                   "inter_pct", "inter_pct_ci95hw",
+                   "inter_pct",
                    "inter_area",
-                   "bound_pct", "bound_pct_ci95hw",
+                   "bound_pct",
                    "bound_area",
                    "free_center", "free_sigma",
                    "inter_center", "inter_sigma",
@@ -2374,12 +2269,11 @@ class MainWindow(QMainWindow):
                 row = [
                     r["sample_name"],
                     f"{r['r2']:.6f}", f"{r['rmse']:.6f}",
-                    f"{r['free_pct']*100:.3f}",  ci_str(r["ci_free"]),
+                    f"{r['free_pct']*100:.3f}",
                     f"{r['free_a']:.4f}",
                     f"{r['inter_pct']*100:.3f}" if is_trip else "n/a",
-                    ci_str(r["ci_inter"]) if is_trip else "n/a",
                     f"{r['inter_a']:.4f}" if is_trip else "n/a",
-                    f"{r['bound_pct']*100:.3f}", ci_str(r["ci_bound"]),
+                    f"{r['bound_pct']*100:.3f}",
                     f"{r['bound_a']:.4f}",
                     f"{c['free']:.2f}",  f"{abs(fp[2]):.2f}",
                     f"{c['inter']:.2f}" if (is_trip and c['inter']) else "fixed",
@@ -2428,9 +2322,6 @@ class MainWindow(QMainWindow):
         """
         # Note: include_header param is declared for API clarity but the method
         # always returns both strings — the caller decides whether to include the header.
-        import math
-        def ci(v):
-            return f"{v*100:.2f}" if (v is not None and not (isinstance(v,float) and math.isnan(v))) else ""
         fp   = r["fp"]
         c    = r["centers"]
         trip = r["fit_mode"] == "triple"
@@ -2438,22 +2329,21 @@ class MainWindow(QMainWindow):
         header = "	".join([
             "Sample",
             "R2", "RMSE",
-            "Free %", "Free % CI±",  "Free area",  "Free center", "Free sigma",
-            "Inter %", "Inter % CI±", "Inter area", "Inter center","Inter sigma",
-            "Bound %", "Bound % CI±","Bound area",  "Bound center","Bound sigma",
+            "Free %", "Free area",  "Free center", "Free sigma",
+            "Inter %", "Inter area", "Inter center","Inter sigma",
+            "Bound %", "Bound area",  "Bound center","Bound sigma",
             "Warnings"
         ])
         data = "	".join([
             r.get("sample_name",""),
             f"{r['r2']:.5f}", f"{r['rmse']:.5f}",
-            f"{r['free_pct']*100:.3f}",  ci(r["ci_free"]),  f"{r['free_a']:.4f}",
+            f"{r['free_pct']*100:.3f}",  f"{r['free_a']:.4f}",
             f"{c['free']:.2f}", f"{abs(fp[2]):.2f}",
             f"{r['inter_pct']*100:.3f}" if trip else "",
-            ci(r["ci_inter"]) if trip else "",
             f"{r['inter_a']:.4f}" if trip else "",
             f"{c['inter']:.2f}" if (trip and c["inter"]) else "fixed",
             f"{abs(fp[5]):.2f}" if trip else "",
-            f"{r['bound_pct']*100:.3f}", ci(r["ci_bound"]), f"{r['bound_a']:.4f}",
+            f"{r['bound_pct']*100:.3f}", f"{r['bound_a']:.4f}",
             f"{c['bound']:.2f}",
             f"{abs(fp[8] if trip else fp[5]):.2f}",
             "; ".join(r.get("warnings",[]))
