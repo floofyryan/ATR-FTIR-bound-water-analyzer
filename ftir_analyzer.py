@@ -47,7 +47,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 # QThread:     base class for background worker threads (fitting, processing)
 # pyqtSignal:  decorator to declare custom signals on QThread subclasses
 
-from PyQt6.QtGui import QFont       # Font objects (not heavily used but available)
+from PyQt6.QtGui import QFont, QColor   # QFont: font objects; QColor: list-item text colors
 
 import matplotlib
 matplotlib.use("QtAgg")             # Tell matplotlib to render into Qt6 widgets
@@ -1490,6 +1490,19 @@ class MainWindow(QMainWindow):
         samp6_row.addWidget(self._b6_clr_btn)
         b6.addLayout(samp6_row)
 
+        # Replicate mode — when checked, the loaded files are treated as repeat
+        # measurements of the SAME sample, and the run reports mean ± SD / %RSD
+        # across them instead of (or in addition to) per-file results. This is
+        # the measurement reproducibility error, distinct from the fit's own
+        # Monte Carlo confidence interval (which only reflects curve-fit noise).
+        self._b6_replicate_cb = QCheckBox("These files are replicates of the same sample")
+        self._b6_replicate_cb.setToolTip(
+            "Check this if all loaded files are repeat runs of one sample.\n"
+            "The summary will show mean ± SD and %RSD across replicates,\n"
+            "which captures run-to-run measurement noise rather than just\n"
+            "the curve-fit's own confidence interval.")
+        b6.addWidget(self._b6_replicate_cb)
+
         b6.addWidget(hline())
 
         # Progress bar
@@ -1515,6 +1528,24 @@ class MainWindow(QMainWindow):
         run6_row = QHBoxLayout()
         run6_row.addWidget(self._b6_save); run6_row.addWidget(self._b6_copy)
         b6.addLayout(run6_row)
+
+        # Replicate reproducibility summary — mean ± SD / %RSD across runs,
+        # shown only when "These files are replicates" was checked at run time.
+        self._b6_rep_frame = QFrame()
+        self._b6_rep_frame.setStyleSheet(
+            f"background:{SURFACE2};border:1px solid {ACCENT};border-radius:8px;")
+        self._b6_rep_frame.setVisible(False)
+        _rl = QVBoxLayout(self._b6_rep_frame); _rl.setContentsMargins(12,10,12,10); _rl.setSpacing(4)
+        _rhead = QLabel("Measurement error  (replicate reproducibility)")
+        _rhead.setStyleSheet(f"color:{ACCENT2};font-size:10px;font-weight:700;letter-spacing:0.5px;")
+        self._b6_rep_n     = QLabel("")
+        self._b6_rep_n.setStyleSheet(f"color:{TEXT_DIM};font-size:11px;")
+        self._b6_rep_free  = QLabel("");  self._b6_rep_free.setStyleSheet(f"color:{FREE_CLR};font-size:12px;font-weight:600;")
+        self._b6_rep_inter = QLabel("");  self._b6_rep_inter.setStyleSheet(f"color:{INTER_CLR};font-size:12px;font-weight:600;")
+        self._b6_rep_bound = QLabel("");  self._b6_rep_bound.setStyleSheet(f"color:{BOUND_CLR};font-size:12px;font-weight:600;")
+        for _w in [_rhead, self._b6_rep_n, self._b6_rep_free, self._b6_rep_inter, self._b6_rep_bound]:
+            _rl.addWidget(_w)
+        b6.addWidget(self._b6_rep_frame)
 
         # Wire up
         self._b6_bg_raw   = None
@@ -2131,11 +2162,11 @@ class MainWindow(QMainWindow):
                     raise ValueError("Too few data points")
                 self._b6_samples.append((name, xs, ys))
                 item = QListWidgetItem(f"  {name}")
-                item.setForeground(__import__('PyQt6.QtGui', fromlist=['QColor']).QColor(TEXT))
+                item.setForeground(QColor(TEXT))
                 self._b6_list.addItem(item)
             except Exception as e:
                 item = QListWidgetItem(f"  ⚠ {name}  ({e})")
-                item.setForeground(__import__('PyQt6.QtGui', fromlist=['QColor']).QColor(DANGER))
+                item.setForeground(QColor(DANGER))
                 self._b6_list.addItem(item)
 
     def _b6_remove_selected(self):
@@ -2206,7 +2237,6 @@ class MainWindow(QMainWindow):
         self._batch_worker.start()
 
     def _b6_on_progress(self, idx, name, result):
-        from PyQt6.QtGui import QColor
         self._b6_progress.setValue(idx + 1)
         n_total = len(self._b6_samples)
         self.status_bar.showMessage(f"Batch: {idx+1} / {n_total} — {name}")
@@ -2258,6 +2288,53 @@ class MainWindow(QMainWindow):
         if n_ok > 0:
             self._b6_save.setEnabled(True)
             self._b6_copy.setEnabled(True)
+        if self._b6_replicate_cb.isChecked():
+            self._show_replicate_stats(results)
+        else:
+            self._b6_rep_frame.setVisible(False)
+
+    @staticmethod
+    def _replicate_stats(results):
+        """Mean / sample SD / %RSD across replicate runs of one sample, per water
+        fraction. Returns None if fewer than 2 successful runs (SD undefined).
+        This is the measurement's run-to-run reproducibility error — distinct
+        from each individual fit's own Monte Carlo confidence interval, which
+        only reflects curve-fit noise within a single spectrum.
+        """
+        ok = [r for r in results if isinstance(r, dict) and "error" not in r]
+        if len(ok) < 2:
+            return None
+        trip = ok[0]["fit_mode"] == "triple"
+        def stats(key):
+            vals = np.array([r[key] for r in ok]) * 100   # fractions -> percent
+            mean = vals.mean(); sd = vals.std(ddof=1)      # sample SD (n-1)
+            rsd = (sd / mean * 100) if mean else float("nan")
+            return mean, sd, rsd
+        out = {"n": len(ok), "free": stats("free_pct"), "bound": stats("bound_pct")}
+        out["inter"] = stats("inter_pct") if trip else None
+        out["fit_mode"] = ok[0]["fit_mode"]
+        return out
+
+    def _show_replicate_stats(self, results):
+        stats = self._replicate_stats(results)
+        if stats is None:
+            self._b6_rep_frame.setVisible(False)
+            self.status_bar.showMessage(
+                self.status_bar.currentMessage() +
+                "  (need ≥2 successful runs to compute replicate error)")
+            return
+        self._b6_rep_n.setText(f"n = {stats['n']} replicate runs")
+        fm, sf, rf = stats["free"]
+        self._b6_rep_free.setText(f"Free:  {fm:.1f}% ± {sf:.1f}  (RSD {rf:.1f}%)")
+        if stats["inter"] is not None:
+            im, si, ri = stats["inter"]
+            self._b6_rep_inter.setText(f"Intermediate:  {im:.1f}% ± {si:.1f}  (RSD {ri:.1f}%)")
+            self._b6_rep_inter.setVisible(True)
+        else:
+            self._b6_rep_inter.setVisible(False)
+        bm, sb, rb = stats["bound"]
+        self._b6_rep_bound.setText(f"Bound:  {bm:.1f}% ± {sb:.1f}  (RSD {rb:.1f}%)")
+        self._b6_rep_frame.setVisible(True)
 
     def _b6_export_csv(self):
         if not self._b6_results:
@@ -2311,6 +2388,22 @@ class MainWindow(QMainWindow):
                     "; ".join(r.get("warnings", [])) or "",
                 ]
                 w.writerow(row)
+
+            # Replicate reproducibility summary, if the user flagged these as
+            # repeat runs of one sample (mean ± SD / %RSD = measurement error)
+            if self._b6_replicate_cb.isChecked():
+                stats = self._replicate_stats(self._b6_results)
+                if stats is not None:
+                    w.writerow([])
+                    w.writerow(["# Measurement error (replicate reproducibility)"])
+                    w.writerow(["n_replicates", stats["n"]])
+                    fm_, sf_, rf_ = stats["free"]
+                    w.writerow(["free_pct_mean", f"{fm_:.3f}"]); w.writerow(["free_pct_sd", f"{sf_:.3f}"]); w.writerow(["free_pct_rsd", f"{rf_:.2f}"])
+                    if stats["inter"] is not None:
+                        im_, si_, ri_ = stats["inter"]
+                        w.writerow(["inter_pct_mean", f"{im_:.3f}"]); w.writerow(["inter_pct_sd", f"{si_:.3f}"]); w.writerow(["inter_pct_rsd", f"{ri_:.2f}"])
+                    bm_, sb_, rb_ = stats["bound"]
+                    w.writerow(["bound_pct_mean", f"{bm_:.3f}"]); w.writerow(["bound_pct_sd", f"{sb_:.3f}"]); w.writerow(["bound_pct_rsd", f"{rb_:.2f}"])
 
             # Also write errors if any
             errs = [r for r in self._b6_results if not (isinstance(r,dict) and "error" not in r)]
