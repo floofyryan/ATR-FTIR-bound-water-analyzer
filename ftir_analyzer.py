@@ -719,11 +719,14 @@ class PlotCanvas(FigureCanvas):
         self.draw()                # Trigger Qt to repaint the widget
 
     def plot_raw(self, bg, samp, norm_wav=None):
-        bx,by=bg; sx,sy=samp
-        if bx[0]>bx[-1]: bx,by=bx[::-1],by[::-1]
+        sx,sy=samp
         if sx[0]>sx[-1]: sx,sy=sx[::-1],sy[::-1]
+        if bg is not None:
+            bx,by=bg
+            if bx[0]>bx[-1]: bx,by=bx[::-1],by[::-1]
         def fn(ax):
-            ax.plot(bx,by,color=TEXT_DIM,lw=1.2,label="Background",alpha=0.85)
+            if bg is not None:
+                ax.plot(bx,by,color=TEXT_DIM,lw=1.2,label="Background",alpha=0.85)
             ax.plot(sx,sy,color=BOUND_CLR,lw=1.4,label="Sample")
             if norm_wav is not None:
                 ax.axvline(norm_wav,color=ACCENT2,lw=1.5,linestyle="--",alpha=0.9,
@@ -733,16 +736,22 @@ class PlotCanvas(FigureCanvas):
             ax.legend(facecolor=SURFACE2,edgecolor=BORDER,labelcolor=TEXT,fontsize=9)
         self._draw(fn)
 
-    def plot_processed(self, bx, by, sx, sy, norm_wav=None):
+    def plot_processed(self, bg, samp, norm_wav=None):
+        sx,sy = samp
+        bx,by = bg if bg is not None else (None, None)
         def fn(ax):
-            ax.plot(bx,by,color=TEXT_DIM,lw=1.1,label="Background (norm.)",alpha=0.7)
+            if bg is not None:
+                ax.plot(bx,by,color=TEXT_DIM,lw=1.1,label="Background (norm.)",alpha=0.7)
             ax.plot(sx,sy,color=ACCENT2,lw=1.4,label="Sample (norm.)")
             if norm_wav is not None:
                 ax.axvline(norm_wav,color=FREE_CLR,lw=1.5,linestyle="--",alpha=0.9,
                            label=f"Norm. @ {norm_wav} cm⁻¹")
-                # Mark the normalisation point — both curves should equal ~1 here
+                # Mark the normalisation point — curves should equal ~1 here
                 import numpy as np
-                for xs,ys,col in [(bx,by,TEXT_DIM),(sx,sy,ACCENT2)]:
+                marks = [(sx,sy,ACCENT2)]
+                if bg is not None:
+                    marks.insert(0, (bx,by,TEXT_DIM))
+                for xs,ys,col in marks:
                     idx = int(np.argmin(np.abs(xs - norm_wav)))
                     ax.plot(xs[idx], ys[idx], "o", color=col, ms=6, zorder=5)
             ax.set_xlabel("Wavenumber (cm⁻¹)"); ax.set_ylabel("Norm. Absorbance")
@@ -750,16 +759,18 @@ class PlotCanvas(FigureCanvas):
             ax.legend(facecolor=SURFACE2,edgecolor=BORDER,labelcolor=TEXT,fontsize=9)
         self._draw(fn)
 
-    def plot_subtracted(self, sx, sub, trim_s=None, trim_e=None):
+    def plot_subtracted(self, sx, sub, trim_s=None, trim_e=None, no_bg=False):
+        curve_lbl = "Sample (normalized)" if no_bg else "Sample − Background"
+        y_lbl     = "Absorbance (AU)" if no_bg else "ΔAbsorbance"
         def fn(ax):
-            ax.plot(sx,sub,color=FREE_CLR,lw=1.4,label="Sample − Background")
+            ax.plot(sx,sub,color=FREE_CLR,lw=1.4,label=curve_lbl)
             ax.axhline(0,color=BORDER,lw=0.8,linestyle="--")
             if trim_s is not None and trim_e is not None:
                 lo, hi = min(trim_s,trim_e), max(trim_s,trim_e)
                 ax.axvspan(lo, hi, alpha=0.13, color=INTER_CLR, label=f"Trim region ({lo}–{hi} cm⁻¹)")
                 ax.axvline(lo, color=INTER_CLR, lw=1.2, linestyle="--", alpha=0.8)
                 ax.axvline(hi, color=INTER_CLR, lw=1.2, linestyle="--", alpha=0.8)
-            ax.set_xlabel("Wavenumber (cm⁻¹)"); ax.set_ylabel("ΔAbsorbance")
+            ax.set_xlabel("Wavenumber (cm⁻¹)"); ax.set_ylabel(y_lbl)
             ax.invert_xaxis()
             ax.legend(facecolor=SURFACE2,edgecolor=BORDER,labelcolor=TEXT,fontsize=9)
         self._draw(fn)
@@ -860,6 +871,15 @@ class StepCard(QFrame):
         bl = QVBoxLayout(self.body); bl.setContentsMargins(16,0,16,16); bl.setSpacing(10)
         self.body_layout = bl
         outer.addWidget(self.body)
+
+    def set_number(self, n):
+        """Renumber this card.  Used when a step is hidden (e.g. Step 3 in
+        no-background mode) so the remaining cards stay sequentially numbered.
+        Updates the visible label unless the card is in the Done state (which
+        shows a tick rather than a number)."""
+        self.number = n
+        if not self._done:
+            self.num_lbl.setText(str(n))
 
     def set_active(self):
         """Transition this card to the Active state (currently in progress)."""
@@ -989,6 +1009,7 @@ class MainWindow(QMainWindow):
         self._bg_raw_orig   = None  # Original background before zero-shift correction
         self._samp_raw_orig = None  # Original sample before zero-shift correction
         self._samp_filename = "sample"  # Stem of the loaded sample file; used to tag fit results
+        self._no_bg    = False  # True = sample-only mode (no background; Step 3 skipped)
 
         self.setAcceptDrops(True)
         self._build_ui()
@@ -1081,7 +1102,22 @@ class MainWindow(QMainWindow):
         self._s1_next.setDisabled(True)
         self._s1_next.clicked.connect(lambda: self._go_step(2))
 
-        b1.addWidget(QLabel("Background spectrum:"))
+        # No-background option — deconvolute a sample with no reference to subtract
+        # (e.g. a pure-water spectrum). Skips Step 3 entirely.
+        self._no_bg_cb = QCheckBox("No background — deconvolute sample only")
+        self._no_bg_cb.setStyleSheet(f"color:{TEXT};font-size:12px;spacing:8px;")
+        self._no_bg_cb.setToolTip(
+            "Enable when you have no background/reference spectrum to subtract\n"
+            "(e.g. deconvoluting a pure-water spectrum). Skips Step 3.")
+        self._no_bg_cb.toggled.connect(self._toggle_no_bg)
+        _nb_hint = QLabel("Skips background subtraction (Step 3). Use for pure-water "
+                          "or already-referenced spectra.")
+        _nb_hint.setStyleSheet(f"color:{TEXT_DIM};font-size:11px;"); _nb_hint.setWordWrap(True)
+        b1.addWidget(self._no_bg_cb); b1.addWidget(_nb_hint)
+        b1.addWidget(hline())
+
+        self._bg_hdr = QLabel("Background spectrum:")
+        b1.addWidget(self._bg_hdr)
         _bg_btn_row = QHBoxLayout()
         _bg_paste_btn = QPushButton("\U0001f4cb  Paste")
         _bg_btn_row.addWidget(bg_btn); _bg_btn_row.addWidget(_bg_paste_btn)
@@ -1092,6 +1128,8 @@ class MainWindow(QMainWindow):
         self._bg_meta.setWordWrap(True)
         b1.addWidget(self._bg_meta)
         b1.addWidget(hline())
+        # Widgets that get disabled when no-background mode is on
+        self._bg_widgets = [self._bg_hdr, bg_btn, _bg_paste_btn, self._bg_lbl, self._bg_meta]
         b1.addWidget(QLabel("Sample spectrum:"))
         _samp_btn_row = QHBoxLayout()
         _samp_paste_btn = QPushButton("\U0001f4cb  Paste")
@@ -1150,7 +1188,7 @@ class MainWindow(QMainWindow):
         self._s2_back = QPushButton("← Back")
         self._s2_run.clicked.connect(self._run_step2)
         self._s2_save.clicked.connect(self._save_step2)
-        self._s2_next.clicked.connect(lambda: self._go_step(3))
+        self._s2_next.clicked.connect(self._go_after_step2)
         self._s2_back.clicked.connect(lambda: self._go_step(1))
         _r2a = QHBoxLayout(); _r2a.addWidget(self._s2_back); _r2a.addWidget(self._s2_run)
         _r2b = QHBoxLayout(); _r2b.addWidget(self._s2_save); _r2b.addWidget(self._s2_next)
@@ -1197,7 +1235,7 @@ class MainWindow(QMainWindow):
         self._s4_run.clicked.connect(self._run_step4)
         self._s4_save.clicked.connect(self._save_step4)
         self._s4_next.clicked.connect(lambda: self._go_step(5))
-        self._s4_back.clicked.connect(lambda: self._go_step(3))
+        self._s4_back.clicked.connect(lambda: self._go_step(2 if self._no_bg else 3))
         _r4a = QHBoxLayout(); _r4a.addWidget(self._s4_back); _r4a.addWidget(self._s4_run)
         _r4b = QHBoxLayout(); _r4b.addWidget(self._s4_save); _r4b.addWidget(self._s4_next)
         b4.addLayout(_r4a); b4.addLayout(_r4b)
@@ -1482,10 +1520,10 @@ class MainWindow(QMainWindow):
         self.norm_wav_sb.blockSignals(False)
         # Redraw whichever plot is currently visible with the new norm line
         tab = self.plot_tabs.tabText(0)
-        if tab == "Raw spectra" and self.bg_raw and self.samp_raw:
+        if tab in ("Raw spectra", "Raw spectrum") and self.samp_raw and (self.bg_raw or self._no_bg):
             self.canvas_main.plot_raw(self.bg_raw, self.samp_raw, norm_wav=value)
-        elif tab == "Normalized spectra" and self.bg_proc and self.samp_proc:
-            self.canvas_main.plot_processed(*self.bg_proc, *self.samp_proc, norm_wav=value)
+        elif tab == "Normalized spectra" and self.samp_proc:
+            self.canvas_main.plot_processed(self.bg_proc, self.samp_proc, norm_wav=value)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -1541,6 +1579,37 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(
             f"Dropped: {Path(path).name} → {'background' if key=='bg' else 'sample'}")
 
+    # ── No-background mode ────────────────────────────────────────────────────
+
+    def _toggle_no_bg(self, checked):
+        """Enable/disable sample-only mode.  When on, the background controls are
+        greyed out, Step 3 (subtraction) is hidden, and the remaining cards are
+        renumbered so they stay sequential (Step 4→3, Step 5→4)."""
+        self._no_bg = checked
+        for w in self._bg_widgets:
+            w.setEnabled(not checked)
+        # Hide the subtraction step and renumber the downstream cards
+        self.s3.setVisible(not checked)
+        self.s4.set_number(3 if checked else 4)
+        self.s5.set_number(4 if checked else 5)
+        # In sample-only mode the sample alone is enough to proceed
+        if checked:
+            self._s1_next.setEnabled(self.samp_raw is not None)
+        else:
+            self._s1_next.setEnabled(self.bg_raw is not None and self.samp_raw is not None)
+        self.s1.status_lbl.setText("")
+        self._go_step(1)
+
+    def _go_after_step2(self):
+        """Advance past Step 2.  In sample-only mode there is no background to
+        subtract, so the normalised sample becomes the Step 3 output directly and
+        we jump straight to the trim step."""
+        if self._no_bg:
+            self.sub_data = self.samp_proc   # pass-through: nothing to subtract
+            self._go_step(4)
+        else:
+            self._go_step(3)
+
     # ── Step navigation ───────────────────────────────────────────────────────
 
     def _go_step(self, n):
@@ -1555,11 +1624,20 @@ class MainWindow(QMainWindow):
             if i < n:   c.set_done()
             elif i == n: c.set_active()
             else:        c.set_locked()
+        # The no-background choice can only be changed on Step 1
+        self._no_bg_cb.setEnabled(n == 1)
         # Update plot for the step being activated
         nw = self.norm_wav_sb.value()
         self._norm_slider_frame.setVisible(n <= 2)
         if n == 1:
-            if self.bg_raw and self.samp_raw:
+            if self._no_bg:
+                if self.samp_raw:
+                    self.canvas_main.plot_raw(None, self.samp_raw, norm_wav=nw)
+                    self.plot_tabs.setTabText(0, "Raw spectrum")
+                    self._s1_next.setEnabled(True)
+                else:
+                    self.canvas_main.placeholder("Load a sample file")
+            elif self.bg_raw and self.samp_raw:
                 self.canvas_main.plot_raw(self.bg_raw, self.samp_raw, norm_wav=nw)
                 self.plot_tabs.setTabText(0, "Raw spectra")
                 self._s1_next.setEnabled(True)
@@ -1567,15 +1645,15 @@ class MainWindow(QMainWindow):
                 self.canvas_main.placeholder("Load background and sample files")
         elif n == 2:
             self.canvas_main.plot_raw(self.bg_raw, self.samp_raw, norm_wav=nw)
-            self.plot_tabs.setTabText(0, "Raw spectra")
-            already_done = self.bg_proc is not None
+            self.plot_tabs.setTabText(0, "Raw spectrum" if self._no_bg else "Raw spectra")
+            already_done = self.samp_proc is not None
             self._s2_save.setEnabled(already_done)
             self._s2_next.setEnabled(already_done)
             if already_done:
-                self.canvas_main.plot_processed(*self.bg_proc, *self.samp_proc, norm_wav=nw)
+                self.canvas_main.plot_processed(self.bg_proc, self.samp_proc, norm_wav=nw)
                 self.plot_tabs.setTabText(0, "Normalized spectra")
         elif n == 3:
-            self.canvas_main.plot_processed(*self.bg_proc, *self.samp_proc)
+            self.canvas_main.plot_processed(self.bg_proc, self.samp_proc)
             self.plot_tabs.setTabText(0, "Normalized spectra")
             already_done = self.sub_data is not None
             self._s3_save.setEnabled(already_done)
@@ -1586,8 +1664,9 @@ class MainWindow(QMainWindow):
         elif n == 4:
             sx,sub = self.sub_data
             self.canvas_main.plot_subtracted(sx, sub,
-                trim_s=self.trim_s_sb.value(), trim_e=self.trim_e_sb.value())
-            self.plot_tabs.setTabText(0, "Subtracted")
+                trim_s=self.trim_s_sb.value(), trim_e=self.trim_e_sb.value(),
+                no_bg=self._no_bg)
+            self.plot_tabs.setTabText(0, "Subtracted" if not self._no_bg else "Normalized sample")
             already_done = self.trim_data is not None
             self._s4_save.setEnabled(already_done)
             self._s4_next.setEnabled(already_done)
@@ -1728,7 +1807,11 @@ class MainWindow(QMainWindow):
             self._samp_meta.setText(meta_str)
             # Store stem (no extension) so fit results can be tagged with the filename
             self._samp_filename = Path(source).stem if source and source != "pasted" else "sample"
-        if self.bg_raw is not None and self.samp_raw is not None:
+        if self._no_bg:
+            if self.samp_raw is not None:
+                self._s1_next.setEnabled(True)
+                self.s1.status_lbl.setText("Sample ready — click Next")
+        elif self.bg_raw is not None and self.samp_raw is not None:
             self._s1_next.setEnabled(True)
             self.s1.status_lbl.setText("Both files ready — click Next")
 
@@ -1743,10 +1826,11 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage("Applying baseline correction and normalization…")
         snip = self.snip_sb.value(); smooth = self.smooth_sb.value()
         norm  = self.norm_wav_sb.value()
+        no_bg = self._no_bg
         def work():
-            bx,by = process_spectrum(*self.bg_raw,   snip, smooth, norm)
+            bg = None if no_bg else process_spectrum(*self.bg_raw, snip, smooth, norm)
             sx,sy = process_spectrum(*self.samp_raw, snip, smooth, norm)
-            return (bx,by),(sx,sy)
+            return bg,(sx,sy)
         self._worker = StepWorker(work)
         self._worker.finished.connect(self._done_step2)
         self._worker.error.connect(self._step_error)
@@ -1754,19 +1838,22 @@ class MainWindow(QMainWindow):
 
     def _done_step2(self, result):
         self.bg_proc, self.samp_proc = result
-        self.canvas_main.plot_processed(*self.bg_proc, *self.samp_proc,
+        self.canvas_main.plot_processed(self.bg_proc, self.samp_proc,
                                          norm_wav=self.norm_wav_sb.value())
         self.plot_tabs.setTabText(0, "Normalized spectra")
         self._s2_run.setEnabled(True); self._s2_run.setText("▶  Apply")
         self._s2_save.setEnabled(True); self._s2_next.setEnabled(True)
-        self.status_bar.showMessage("Step 2 complete — inspect the normalized spectra, then save or proceed.")
+        nxt = "trim" if self._no_bg else "subtract"
+        self.status_bar.showMessage(f"Step 2 complete — inspect the normalized spectrum, then save or proceed to {nxt}.")
 
     def _save_step2(self):
         d = QFileDialog.getExistingDirectory(self, "Select folder to save CSVs")
         if not d: return
-        bx,by = self.bg_proc; sx,sy = self.samp_proc
-        save_csv_two_col(Path(d)/"background_normalized.csv", bx, by)
-        save_csv_two_col(Path(d)/"sample_normalized.csv",     sx, sy)
+        sx,sy = self.samp_proc
+        save_csv_two_col(Path(d)/"sample_normalized.csv", sx, sy)
+        if self.bg_proc is not None:
+            bx,by = self.bg_proc
+            save_csv_two_col(Path(d)/"background_normalized.csv", bx, by)
         self.status_bar.showMessage(f"Saved normalized CSVs to {d}")
 
     # ── Step 3 ────────────────────────────────────────────────────────────────
@@ -2397,14 +2484,15 @@ class MainWindow(QMainWindow):
         if self.sub_data is None:
             return   # Step 3 not yet run — nothing to update
         tab = self.plot_tabs.tabText(0)
-        if tab in ("Subtracted", "Trimmed region"):
+        if tab in ("Subtracted", "Normalized sample", "Trimmed region"):
             sx, sub = self.sub_data
             # Redraw with the shaded trim region overlay
             self.canvas_main.plot_subtracted(
                 sx, sub,
                 trim_s=self.trim_s_sb.value(),
-                trim_e=self.trim_e_sb.value())
-            self.plot_tabs.setTabText(0, "Subtracted")  # Restore "Subtracted" tab title
+                trim_e=self.trim_e_sb.value(),
+                no_bg=self._no_bg)
+            self.plot_tabs.setTabText(0, "Normalized sample" if self._no_bg else "Subtracted")
 
     # ── Error handler ─────────────────────────────────────────────────────────
 
