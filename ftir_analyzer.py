@@ -1954,21 +1954,34 @@ class MainWindow(QMainWindow):
         def work():
             bx,by = self.bg_proc; sx,sy = self.samp_proc
             by_r = np.interp(sx, bx, by)   # Resample bg onto sample x-grid
-            return sx, sy - by_r            # Elementwise subtraction
+            return sx, sy - by_r, (bx.min(), bx.max())   # Include bg coverage for the overlap check below
         self._worker = StepWorker(work)
         self._worker.finished.connect(self._done_step3)
         self._worker.error.connect(self._step_error)
         self._worker.start()
 
     def _done_step3(self, result):
-        self.sub_data = result
-        sx, sub = result
+        sx, sub, bg_range = result
+        self.sub_data = (sx, sub)
         self.canvas_main.plot_subtracted(sx, sub,
             trim_s=self.trim_s_sb.value(), trim_e=self.trim_e_sb.value())
         self.plot_tabs.setTabText(0, "Subtracted")
         self._s3_run.setEnabled(True); self._s3_run.setText("▶  Subtract")
         self._s3_save.setEnabled(True); self._s3_next.setEnabled(True)
-        self.status_bar.showMessage("Step 3 complete — check the subtracted spectrum, then save or proceed.")
+        # Outside the background's measured range, np.interp silently holds the
+        # nearest edge value flat instead of extrapolating — if that overlaps the
+        # O–H trim region, the "subtraction" there is against a constant, not a
+        # real background reading, and the result is misleading. Warn so the user
+        # knows to widen the background scan or the trim window.
+        ts, te = self.trim_s_sb.value(), self.trim_e_sb.value()
+        bg_lo, bg_hi = bg_range
+        if min(ts, te) < bg_lo or max(ts, te) > bg_hi:
+            self.status_bar.showMessage(
+                f"⚠  Background only covers {bg_lo:.0f}–{bg_hi:.0f} cm⁻¹ — part of the "
+                f"trim region ({ts:.0f}–{te:.0f}) falls outside it and is being subtracted "
+                f"against a flat extrapolated value, not real background data.")
+        else:
+            self.status_bar.showMessage("Step 3 complete — check the subtracted spectrum, then save or proceed.")
         if self._s3_advance:        # First run — advance automatically (Step 3 has no parameters to tune)
             self._go_step(4)
 
