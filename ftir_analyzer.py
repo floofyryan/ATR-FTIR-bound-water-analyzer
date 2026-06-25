@@ -461,6 +461,16 @@ def process_spectrum(xs, ys, snip_iter, smooth_win, norm_wav):
     nv = sm[norm_idx] if sm[norm_idx] != 0 else 1.0   # Guard against divide-by-zero
     return xs, sm / nv                              # Return ascending x and normalised y
 
+# Literature H-bonding-strength windows for floating-centre fits (cm⁻¹).
+# Used when "constrain to literature ranges" is enabled — lets each peak
+# centre float freely within its physically meaningful band instead of
+# just around the user's initial-guess value.
+PEAK_RANGES = {
+    "bound": (3200, 3250),   # Strongly H-bonded / "ice-like" water
+    "inter": (3400, 3450),   # Intermediate / weakly bound water
+    "free":  (3550, 3625),   # Weakly/non-H-bonded "free" water
+}
+
 def _build_bounds(anchor_mode, fit_mode, params, constraints):
     """Construct the (lower_bounds, upper_bounds) arrays required by least_squares.
 
@@ -469,29 +479,37 @@ def _build_bounds(anchor_mode, fit_mode, params, constraints):
     be negative).  Sigmas are bounded to [sig_min, sig_max] to prevent the
     optimizer producing meaninglessly narrow (spike) or wide (flat) peaks.
 
-    Floating mode: centres ARE in the parameter vector and are bounded to
-    ±cw (80) cm⁻¹ around their initial guesses.  This prevents peaks from
-    swapping order or drifting to physically unreasonable wavenumbers.
+    Floating mode: centres ARE in the parameter vector.  By default they are
+    bounded to ±cw (80) cm⁻¹ around their initial guesses.  If
+    constraints["center_bounds"] is set (a dict with "free"/"inter"/"bound"
+    (lo, hi) tuples), those literature H-bonding ranges are used instead —
+    letting the centre float freely within a physically meaningful window
+    rather than just around whatever the user typed as an initial guess.
     """
     sig_lo, sig_hi, INF = constraints["sig_min"], constraints["sig_max"], np.inf
     fc, ic, bc = params["fc"], params["ic"], params["bc"]   # Initial centre guesses
     cw = 80                    # Maximum allowed centre shift in cm⁻¹ (floating mode)
+    cb = constraints.get("center_bounds")   # Optional literature-range override
+    if cb:
+        f_lo,f_hi = cb["free"]; i_lo,i_hi = cb["inter"]; b_lo,b_hi = cb["bound"]
+    else:
+        f_lo,f_hi = fc-cw,fc+cw; i_lo,i_hi = ic-cw,ic+cw; b_lo,b_hi = bc-cw,bc+cw
     if fit_mode == "triple":
         if anchor_mode == "anchored":
             # Parameter order: [h_free, sig_free, h_inter, sig_inter, h_bound, sig_bound]
             return ([0,sig_lo,0,sig_lo,0,sig_lo], [INF,sig_hi,INF,sig_hi,INF,sig_hi])
         else:
             # Parameter order: [h_f, c_f, s_f, h_i, c_i, s_i, h_b, c_b, s_b]
-            return ([0,fc-cw,sig_lo,0,ic-cw,sig_lo,0,bc-cw,sig_lo],
-                    [INF,fc+cw,sig_hi,INF,ic+cw,sig_hi,INF,bc+cw,sig_hi])
+            return ([0,f_lo,sig_lo,0,i_lo,sig_lo,0,b_lo,sig_lo],
+                    [INF,f_hi,sig_hi,INF,i_hi,sig_hi,INF,b_hi,sig_hi])
     else:                      # double Gaussian — no intermediate peak
         if anchor_mode == "anchored":
             # Parameter order: [h_free, sig_free, h_bound, sig_bound]
             return ([0,sig_lo,0,sig_lo], [INF,sig_hi,INF,sig_hi])
         else:
             # Parameter order: [h_f, c_f, s_f, h_b, c_b, s_b]
-            return ([0,fc-cw,sig_lo,0,bc-cw,sig_lo],
-                    [INF,fc+cw,sig_hi,INF,bc+cw,sig_hi])
+            return ([0,f_lo,sig_lo,0,b_lo,sig_lo],
+                    [INF,f_hi,sig_hi,INF,b_hi,sig_hi])
 
 def run_fit(xT, yT, params, fit_mode, anchor_mode, constraints):
     """Fit two or three Gaussians to the processed O-H stretch spectrum.
@@ -505,7 +523,8 @@ def run_fit(xT, yT, params, fit_mode, anchor_mode, constraints):
     fit_mode    : "triple" (3 Gaussians) or "double" (2 Gaussians, no intermediate)
     anchor_mode : "anchored" — centres fixed, only height+sigma optimised
                   "float"    — all 9 (or 6) parameters optimised
-    constraints : dict with sig_min and sig_max to bound sigma during fitting
+    constraints : dict with sig_min and sig_max to bound sigma during fitting,
+                  plus an optional "center_bounds" dict (see _build_bounds)
 
     Returns a dict with: spectral arrays, areas, percentages, R², RMSE,
     fitted parameters, centre positions, and any quality warnings.
@@ -515,6 +534,9 @@ def run_fit(xT, yT, params, fit_mode, anchor_mode, constraints):
     ic,ih,isg = params["ic"],params["ih"],params["isg"] # Intermediate
     bc,bh,bs = params["bc"],params["bh"],params["bs"]   # Bound
     bounds = _build_bounds(anchor_mode, fit_mode, params, constraints)  # Build (lo, hi) arrays
+    # least_squares requires the initial guess to lie within [lo, hi] — clip it,
+    # since a literature centre range may not contain the user's typed guess.
+    def clip0(x0): return np.clip(np.asarray(x0,dtype=float), bounds[0], bounds[1]).tolist()
     # ── Build model functions and run the optimiser ───────────────────────────
     if fit_mode == "triple":
         if anchor_mode == "anchored":
@@ -522,7 +544,7 @@ def run_fit(xT, yT, params, fit_mode, anchor_mode, constraints):
             # captured from outer scope (fc, ic, bc) and held fixed.
             # p = [h_free, sig_free, h_inter, sig_inter, h_bound, sig_bound]
             def model(p,x): return gaus(x,p[0],fc,p[1])+gaus(x,p[2],ic,p[3])+gaus(x,p[4],bc,p[5])
-            res = least_squares(lambda p: model(p,xT)-yT, [fh,fs,ih,isg,bh,bs],
+            res = least_squares(lambda p: model(p,xT)-yT, clip0([fh,fs,ih,isg,bh,bs]),
                                 method="trf", bounds=bounds, max_nfev=4000)
             # Rebuild the full 9-element fp list by inserting fixed centres
             p=res.x; fp=[p[0],fc,p[1],p[2],ic,p[3],p[4],bc,p[5]]
@@ -530,7 +552,7 @@ def run_fit(xT, yT, params, fit_mode, anchor_mode, constraints):
             # Floating: all 9 parameters are optimised
             # p = [h_f, c_f, s_f, h_i, c_i, s_i, h_b, c_b, s_b]
             def model(p,x): return gaus(x,p[0],p[1],p[2])+gaus(x,p[3],p[4],p[5])+gaus(x,p[6],p[7],p[8])
-            res = least_squares(lambda p: model(p,xT)-yT, [fh,fc,fs,ih,ic,isg,bh,bc,bs],
+            res = least_squares(lambda p: model(p,xT)-yT, clip0([fh,fc,fs,ih,ic,isg,bh,bc,bs]),
                                 method="trf", bounds=bounds, max_nfev=4000)
             fp=res.x.tolist()   # Already has 9 elements
         # Evaluate each individual Gaussian curve at the fitted parameters
@@ -545,13 +567,13 @@ def run_fit(xT, yT, params, fit_mode, anchor_mode, constraints):
         if anchor_mode == "anchored":
             # p = [h_free, sig_free, h_bound, sig_bound]
             def model(p,x): return gaus(x,p[0],fc,p[1])+gaus(x,p[2],bc,p[3])
-            res = least_squares(lambda p: model(p,xT)-yT, [fh,fs,bh,bs],
+            res = least_squares(lambda p: model(p,xT)-yT, clip0([fh,fs,bh,bs]),
                                 method="trf", bounds=bounds, max_nfev=4000)
             p=res.x; fp=[p[0],fc,p[1],p[2],bc,p[3]]
         else:
             # p = [h_f, c_f, s_f, h_b, c_b, s_b]
             def model(p,x): return gaus(x,p[0],p[1],p[2])+gaus(x,p[3],p[4],p[5])
-            res = least_squares(lambda p: model(p,xT)-yT, [fh,fc,fs,bh,bc,bs],
+            res = least_squares(lambda p: model(p,xT)-yT, clip0([fh,fc,fs,bh,bc,bs]),
                                 method="trf", bounds=bounds, max_nfev=4000)
             fp=res.x.tolist()
         yfit=gaus(xT,fp[0],fp[1],fp[2])+gaus(xT,fp[3],fp[4],fp[5])
@@ -1266,6 +1288,20 @@ class MainWindow(QMainWindow):
         self.anchor_note.setStyleSheet(f"color:{TEXT_DIM};font-size:11px;"); self.anchor_note.setWordWrap(True)
         b5.addWidget(self.anchor_note)
 
+        # Literature-range bounding — only meaningful in floating mode. Lets each
+        # centre move freely within its physically meaningful H-bonding window
+        # instead of being tied to ±80 cm⁻¹ around the user's initial guess.
+        self.lit_range_cb = QCheckBox("Limit floating centers to literature ranges")
+        self.lit_range_cb.setStyleSheet(f"color:{TEXT};font-size:12px;spacing:8px;")
+        self.lit_range_cb.setToolTip(
+            "Bound · 3200–3250 cm⁻¹ (strongly H-bonded / ice-like)\n"
+            "Intermediate · 3400–3450 cm⁻¹ (weakly bound)\n"
+            "Free · 3550–3625 cm⁻¹ (weakly/non-H-bonded)\n\n"
+            "Centers float freely to fit the spectrum, but stay within these "
+            "physically meaningful ranges instead of drifting anywhere.")
+        self.lit_range_cb.setEnabled(False)   # Only usable when floating mode is active
+        b5.addWidget(self.lit_range_cb)
+
         b5.addWidget(hline())
 
         # Sigma constraints
@@ -1950,6 +1986,8 @@ class MainWindow(QMainWindow):
                       bc=self.bc_sb.value(), bh=self.bh_sb.value(), bs=self.bs_sb.value())
         con = dict(sig_min=self.sig_min_sb.value() if constrained else 1,
                    sig_max=self.sig_max_sb.value() if constrained else 500)
+        if anchor == "float" and self.lit_range_cb.isChecked():
+            con["center_bounds"] = PEAK_RANGES
         # Snapshot current params so user can restore them after experimenting
         self.last_fit_params = dict(
             fit_mode=fit_mode, anchor=anchor, constrained=constrained,
@@ -2096,6 +2134,9 @@ class MainWindow(QMainWindow):
         self.anchor_note.setText("Centers fixed — only height & sigma optimized."
                                   if mode=="anchored"
                                   else "Centers used as initial guesses, allowed to shift.")
+        self.lit_range_cb.setEnabled(mode == "float")
+        if mode == "anchored":
+            self.lit_range_cb.setChecked(False)
 
     def _set_constrain(self, on):
         self.constrain_btn.setChecked(on); self.unconstrain_btn.setChecked(not on)
@@ -2180,6 +2221,8 @@ class MainWindow(QMainWindow):
             "constraints": {
                 "sig_min": self.sig_min_sb.value() if constrained else 1,
                 "sig_max": self.sig_max_sb.value() if constrained else 500,
+                **({"center_bounds": PEAK_RANGES}
+                   if anchor == "float" and self.lit_range_cb.isChecked() else {}),
             },
             "params": dict(
                 fc=self.fc_sb.value(), fh=self.fh_sb.value(), fs=self.fs_sb.value(),
